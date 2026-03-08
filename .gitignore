@@ -1,0 +1,26 @@
+# Runtime data
+logs/
+runs/
+data/products/
+data/trash/
+
+# Optional local profiles / secrets
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Keep directories in git
+!logs/.gitkeep
+!runs/.gitkeep
+!data/products/.gitkeep
+!data/trash/.gitkeep
+!data/claw-profiles/.gitkeep
