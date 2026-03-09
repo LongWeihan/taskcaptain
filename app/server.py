@@ -32,7 +32,8 @@ HOST = os.environ.get('PRODUCTS_UI_HOST', '127.0.0.1')
 PORT = int(os.environ.get('PRODUCTS_UI_PORT', '8765'))
 DEFAULT_LANG = os.environ.get('PRODUCTS_UI_DEFAULT_LANG', 'en')
 DEFAULT_AGENT_ENDPOINT = os.environ.get('PRODUCTS_UI_DEFAULT_OPENAI_BASE_URL', 'http://localhost:8317/v1')
-DEFAULT_CODEX_ENDPOINT = os.environ.get('PRODUCTS_UI_DEFAULT_OPENAI_BASE_URL', 'http://localhost:8317/v1')
+DEFAULT_CODEX_ENDPOINT = os.environ.get('PRODUCTS_UI_DEFAULT_CODEX_BASE_URL', 'https://www.right.codes/codex/v1')
+DEFAULT_CODEX_API_KEY = os.environ.get('PRODUCTS_UI_DEFAULT_CODEX_API_KEY', '')
 DEFAULT_PRODUCT_FOLDER = os.environ.get('PRODUCTS_UI_DEFAULT_PRODUCT_FOLDER', str(ROOT / 'workspace'))
 DEFAULT_PROXY = os.environ.get('PRODUCTS_UI_PROXY', '').strip()
 DEFAULT_NO_PROXY = os.environ.get('PRODUCTS_UI_NO_PROXY', '127.0.0.1,localhost,::1').strip()
@@ -267,6 +268,37 @@ def slugify(text: str) -> str:
     return base or f'product-{uuid.uuid4().hex[:8]}'
 
 
+def normalize_product_identity(raw_name: str, raw_folder: str) -> tuple[str, str, bool]:
+    name = (raw_name or '').strip()
+    folder = (raw_folder or '').strip()
+    inferred_from_name_path = False
+
+    default_folder = str(Path(DEFAULT_PRODUCT_FOLDER).expanduser())
+    folder = str(Path(folder).expanduser()) if folder else ''
+
+    looks_like_path = bool(name) and (
+        name.startswith('/')
+        or name.startswith('~')
+        or name.startswith('./')
+        or name.startswith('../')
+        or bool(re.match(r'^[A-Za-z]:[\\/]', name))
+    )
+
+    if looks_like_path and (not folder or folder == default_folder):
+        p = Path(name).expanduser()
+        folder = str(p)
+        if p.name.strip():
+            name = p.name.strip()
+        inferred_from_name_path = True
+
+    if not name:
+        name = 'Untitled Product'
+    if not folder:
+        folder = default_folder
+
+    return name, folder, inferred_from_name_path
+
+
 def product_dir(product_id: str) -> Path:
     return PRODUCTS / product_id
 
@@ -397,7 +429,7 @@ def normalize_config(cfg: dict) -> tuple[dict, bool]:
             changed = True
     codex_defaults = {
         'endpoint': DEFAULT_CODEX_ENDPOINT,
-        'apiKey': '',
+        'apiKey': DEFAULT_CODEX_API_KEY,
         'model': 'gpt-5.4-medium',
         'thinking': 'medium',
         'planMode': True,
@@ -546,7 +578,10 @@ def probe_openai_like_endpoint(base_url: str, api_key: str | None = None) -> dic
 
 
 def create_product(form: dict[str, str]) -> str:
-    name = form.get('name', '').strip() or 'Untitled Product'
+    name, product_folder, inferred_from_name_path = normalize_product_identity(
+        form.get('name', ''),
+        form.get('productFolder', ''),
+    )
     product_id = slugify(name)
     d = product_dir(product_id)
     i = 2
@@ -561,7 +596,7 @@ def create_product(form: dict[str, str]) -> str:
         'id': product_id,
         'name': name,
         'goal': form.get('goal', '').strip(),
-        'productFolder': form.get('productFolder', '').strip(),
+        'productFolder': product_folder,
         'claw': {
             'endpoint': form.get('clawEndpoint', '').strip(),
             'apiKey': form.get('clawApiKey', '').strip(),
@@ -572,8 +607,8 @@ def create_product(form: dict[str, str]) -> str:
             'skills': form.get('clawSkills', '').strip(),
         },
         'codex': {
-            'endpoint': form.get('codexEndpoint', '').strip(),
-            'apiKey': form.get('codexApiKey', '').strip(),
+            'endpoint': form.get('codexEndpoint', '').strip() or DEFAULT_CODEX_ENDPOINT,
+            'apiKey': form.get('codexApiKey', '').strip() or DEFAULT_CODEX_API_KEY,
             'model': form.get('codexModel', '').strip() or 'gpt-5.4-medium',
             'thinking': form.get('codexThinking', '').strip() or 'medium',
             'planMode': form.get('codexPlanMode', '') == 'on',
@@ -604,6 +639,8 @@ def create_product(form: dict[str, str]) -> str:
     save_product_state(product_id, st)
     append_log(d / 'logs' / 'claw.log', f'[{now_iso()}] Product created.')
     append_log(d / 'logs' / 'codex.log', f'[{now_iso()}] Product created.')
+    if inferred_from_name_path:
+        append_log(d / 'logs' / 'claw.log', f'[{now_iso()}] Interpreted product name as a filesystem path and normalized to name={name!r}, productFolder={product_folder!r}.')
     append_user_claw_message(product_id, 'claw', f"Agent profile '{profile.get('name')}' attached to this product. Ready for user instructions.")
     return product_id
 
@@ -702,7 +739,7 @@ def clear_active_self_test(product_id: str):
         ACTIVE_SELF_TESTS.pop(product_id, None)
 
 
-def terminate_process_tree(proc):
+def terminate_process_tree(proc, grace_seconds: float = 5.0):
     if not proc:
         return
     try:
@@ -715,6 +752,21 @@ def terminate_process_tree(proc):
     except Exception:
         try:
             proc.terminate()
+        except Exception:
+            pass
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline:
+        try:
+            if proc.poll() is not None:
+                return
+        except Exception:
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
         except Exception:
             pass
 
@@ -936,46 +988,183 @@ def run_self_test(product_id: str) -> None:
         clear_active_self_test(product_id)
 
 
-def run_codex_command(cmd: list[str], env: dict, timeout_seconds: int, stop_event: threading.Event, product_id: str):
-    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+def run_codex_command(
+    cmd: list[str],
+    env: dict,
+    timeout_seconds: int | None,
+    stop_event: threading.Event,
+    product_id: str,
+    progress_probe=None,
+    idle_grace_seconds: int = 1800,
+    hard_deadlock_seconds: int | None = 43200,
+    poll_seconds: float = 2.0,
+):
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, bufsize=1)
     set_active_proc(product_id, proc)
     start = time.time()
+    activity = {'stdout': start, 'stderr': start}
+    io_lock = threading.Lock()
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def reader(stream, chunks: list[str], key: str):
+        try:
+            while True:
+                line = stream.readline()
+                if line == '':
+                    break
+                with io_lock:
+                    chunks.append(line)
+                    activity[key] = time.time()
+        except Exception as e:
+            with io_lock:
+                chunks.append(f'\n[taskcaptain {key} reader error] {e}\n')
+                activity[key] = time.time()
+
+    t_out = threading.Thread(target=reader, args=(proc.stdout, stdout_chunks, 'stdout'), daemon=True)
+    t_err = threading.Thread(target=reader, args=(proc.stderr, stderr_chunks, 'stderr'), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    def combined_output() -> str:
+        with io_lock:
+            stdout = ''.join(stdout_chunks)
+            stderr = ''.join(stderr_chunks)
+        return stdout + (("\n" + stderr) if stderr else '')
+
+    last_probe_value = None
+    last_probe_at = start
+    if progress_probe is not None:
+        try:
+            last_probe_value = progress_probe()
+        except Exception as e:
+            last_probe_value = {'probeError': str(e)}
+
     while True:
         if stop_event.is_set():
+            terminate_process_tree(proc)
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            return -15, combined_output(), True
+
+        now = time.time()
+        if progress_probe is not None:
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-            try:
-                stdout, stderr = proc.communicate(timeout=5)
-            except Exception:
-                stdout, stderr = '', ''
-            return -15, (stdout or '') + (('\n' + stderr) if stderr else ''), True
+                probe_value = progress_probe()
+            except Exception as e:
+                probe_value = {'probeError': str(e)}
+            if probe_value != last_probe_value:
+                last_probe_value = probe_value
+                last_probe_at = now
+
         if proc.poll() is not None:
-            stdout, stderr = proc.communicate()
-            return proc.returncode, (stdout or '') + (('\n' + stderr) if stderr else ''), False
-        if time.time() - start > timeout_seconds:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-            try:
-                stdout, stderr = proc.communicate(timeout=5)
-            except Exception:
-                stdout, stderr = '', ''
-            return 124, (stdout or '') + (('\n' + stderr) if stderr else ''), False
-        time.sleep(1)
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            return proc.returncode, combined_output(), False
+
+        if timeout_seconds is not None and now - start > timeout_seconds:
+            terminate_process_tree(proc)
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            return 124, combined_output(), False
+
+        last_activity_at = max(last_probe_at, activity['stdout'], activity['stderr'])
+        if idle_grace_seconds and now - last_activity_at > idle_grace_seconds:
+            terminate_process_tree(proc)
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            out = combined_output()
+            out += f"\n[taskcaptain] terminated after {int(now - last_activity_at)}s with no progress evidence."
+            return 124, out, False
+
+        if hard_deadlock_seconds is not None and now - start > hard_deadlock_seconds:
+            terminate_process_tree(proc)
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            out = combined_output()
+            out += f"\n[taskcaptain] terminated after absolute deadlock guard of {int(hard_deadlock_seconds)}s."
+            return 124, out, False
+
+        time.sleep(poll_seconds)
 
 
 def summarize_user_claw_messages(st: dict, limit: int = 8) -> str:
     user_msgs = [x.get('text', '') for x in st.get('conversations', {}).get('userClaw', []) if x.get('role') == 'user']
     return '\n'.join(f'- {x}' for x in user_msgs[-limit:]) or '- none'
+
+
+
+def extract_terminal_token(text: str) -> str | None:
+    matches = re.findall(r'(?m)^(DELIVERED_OK|FAILED_FINAL|NEEDS_MORE_WORK)\s*$', text or '')
+    return matches[-1] if matches else None
+
+
+def extract_json_object(text: str) -> dict | None:
+    raw = (text or '').strip()
+    if not raw:
+        return None
+    fenced = re.match(r'^```(?:json)?\s*(.*?)\s*```$', raw, re.S)
+    if fenced:
+        raw = fenced.group(1).strip()
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(raw):
+        if ch != '{':
+            continue
+        try:
+            obj, _ = decoder.raw_decode(raw[i:])
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def build_chat_completions_url(base: str) -> str:
+    base = (base or '').rstrip('/')
+    if not base:
+        return ''
+    if base.endswith('/chat/completions'):
+        return base
+    return f'{base}/chat/completions'
+
+
+def openai_chat_completion(base_url: str, api_key: str | None, model: str, messages: list[dict], timeout: int = 120) -> tuple[str, dict]:
+    url = build_chat_completions_url(base_url)
+    if not url:
+        raise RuntimeError('missing chat completions base url')
+    headers = {'Content-Type': 'application/json'}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+    payload = {
+        'model': model,
+        'messages': messages,
+        'stream': False,
+    }
+    req = Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+    with urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode('utf-8', 'ignore')
+    parsed = json.loads(body)
+    choices = parsed.get('choices') or []
+    if not choices:
+        raise RuntimeError(f'no choices in chat completion response: {body[:500]}')
+    message = choices[0].get('message') or {}
+    content = message.get('content', '')
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get('type') == 'text':
+                    parts.append(item.get('text', ''))
+                elif 'text' in item:
+                    parts.append(str(item.get('text', '')))
+        content = ''.join(parts)
+    return str(content or ''), parsed
 
 
 def claw_identity_block(cfg: dict) -> str:
@@ -990,16 +1179,15 @@ def claw_identity_block(cfg: dict) -> str:
     )
 
 
+
 def run_supervision_loop(product_id: str, run_id: str, stop_event: threading.Event) -> None:
     d = product_dir(product_id)
     cfg = load_product_config(product_id)
-    state_path = d / 'state.json'
     claw_log = d / 'logs' / 'claw.log'
     codex_log = d / 'logs' / 'codex.log'
     product_folder = cfg.get('productFolder') or '/tmp'
     codex = cfg.get('codex', {})
     claw_eff = effective_claw_config(cfg)
-    session_name = codex.get('sessionName') or f'oc-product-{product_id}'
     env = build_codex_env(cfg)
 
     def set_state(**kwargs):
@@ -1014,108 +1202,329 @@ def run_supervision_loop(product_id: str, run_id: str, stop_event: threading.Eve
     def log_codex(text: str):
         append_log(codex_log, f'[{now_iso()}] {text}')
 
+    def workspace_snapshot(max_files: int = 120, max_depth: int = 4) -> str:
+        root = Path(product_folder)
+        if not root.exists():
+            return f'(workspace missing) {product_folder}'
+        ignore = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', '.idea', '.pytest_cache', 'dist', 'build'}
+        lines = []
+        truncated = False
+        try:
+            for path in sorted(root.rglob('*')):
+                try:
+                    rel = path.relative_to(root)
+                except Exception:
+                    continue
+                if any(part in ignore for part in rel.parts):
+                    continue
+                if path.is_dir():
+                    continue
+                if len(rel.parts) > max_depth:
+                    truncated = True
+                    continue
+                try:
+                    size = path.stat().st_size
+                except Exception:
+                    size = 0
+                lines.append(f'- {rel.as_posix()} ({size} bytes)')
+                if len(lines) >= max_files:
+                    truncated = True
+                    break
+        except Exception as e:
+            return f'(workspace snapshot error: {e})'
+        if not lines:
+            return '(workspace is empty)'
+        if truncated:
+            lines.append(f'- … truncated after {len(lines)} entries')
+        return '\n'.join(lines)
+
+    def workspace_material_files(max_depth: int = 4) -> list[str]:
+        root = Path(product_folder)
+        if not root.exists():
+            return []
+        ignore_dirs = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', '.idea', '.pytest_cache', 'dist', 'build'}
+        ignore_names = {'.DS_Store'}
+        ignore_prefixes = {'.w', '.probe_', '.tc_'}
+        files: list[str] = []
+        try:
+            for path in sorted(root.rglob('*')):
+                try:
+                    rel = path.relative_to(root)
+                except Exception:
+                    continue
+                if any(part in ignore_dirs for part in rel.parts):
+                    continue
+                if path.is_dir():
+                    continue
+                if len(rel.parts) > max_depth:
+                    continue
+                name = path.name
+                if name in ignore_names:
+                    continue
+                if any(name.startswith(prefix) for prefix in ignore_prefixes):
+                    continue
+                files.append(rel.as_posix())
+        except Exception:
+            return []
+        return files
+
+    def build_file_delta(before: list[str], after: list[str]) -> str:
+        before_set = set(before)
+        after_set = set(after)
+        added = sorted(after_set - before_set)
+        removed = sorted(before_set - after_set)
+        kept = sorted(after_set & before_set)
+        lines = []
+        if added:
+            lines.append('Added files:')
+            lines.extend(f'- {x}' for x in added[:40])
+        if removed:
+            lines.append('Removed files:')
+            lines.extend(f'- {x}' for x in removed[:20])
+        if kept and not added and not removed:
+            lines.append('No material file delta detected.')
+        return '\n'.join(lines) if lines else 'No material file delta detected.'
+
+    def workspace_progress_signature() -> dict:
+        root = Path(product_folder)
+        files = workspace_material_files()
+        sample = []
+        total_size = 0
+        newest_mtime = 0.0
+        for rel in files[:80]:
+            path = root / rel
+            try:
+                stat = path.stat()
+                total_size += stat.st_size
+                newest_mtime = max(newest_mtime, stat.st_mtime)
+                sample.append((rel, stat.st_size, int(stat.st_mtime)))
+            except Exception:
+                sample.append((rel, None, None))
+        progress_path = root / '.taskcaptain' / 'progress.json'
+        progress_blob = None
+        if progress_path.exists():
+            try:
+                progress_blob = progress_path.read_text(encoding='utf-8', errors='ignore')[:4000]
+            except Exception as e:
+                progress_blob = f'progress-read-error:{e}'
+        return {
+            'filesCount': len(files),
+            'filesSample': sample,
+            'totalSize': total_size,
+            'newestMtime': int(newest_mtime) if newest_mtime else 0,
+            'progressBlob': progress_blob,
+        }
+
+    def default_codex_task(turn: int, files: list[str]) -> str:
+        if not files:
+            return (
+                f"Build the smallest runnable demo for '{cfg.get('name')}' inside the current working directory.\n"
+                f"Goal: {cfg.get('goal')}\n"
+                "The workspace is empty. Your priority is to create real files immediately instead of planning only.\n"
+                "Create at minimum: README.md, index.html, app.js, styles.css.\n"
+                "Prefer a static implementation with seeded demo data unless a backend is clearly required by the goal.\n"
+                "Do one bounded verification command after creating files, then reply with a concise summary of CHANGES, VERIFICATION, and REMAINING."
+            )
+        return (
+            f"Continue implementing '{cfg.get('name')}' in the current working directory.\n"
+            f"Goal: {cfg.get('goal')}\n"
+            "Read the existing workspace first, then make the highest-value next changes.\n"
+            "Run only bounded verification commands.\n"
+            "Reply with a concise summary of CHANGES, VERIFICATION, and REMAINING blockers."
+        )
+
+    def call_claw_json(stage: str, user_prompt: str, timeout_seconds: int = 120) -> tuple[dict, str]:
+        system_prompt = (
+            f"You are {claw_eff.get('profileName')}, the product manager, researcher, supervisor, and acceptance lead for TaskCaptain.\n"
+            f"Soul: {claw_eff.get('soul')}\n"
+            f"Skills: {claw_eff.get('skills')}\n"
+            "Your job is to drive an autonomous delivery loop: understand the requirement, inspect evidence, decide what Codex should do next, and decide whether the product is delivered or failed.\n"
+            "Codex is the implementation agent. You are not Codex. Do not pretend to have edited files yourself.\n"
+            "Be strict and evidence-based. Do not declare delivery unless the workspace and verification evidence justify it.\n"
+            "Respond with JSON only, no markdown fences."
+        )
+        text, _ = openai_chat_completion(
+            claw_eff.get('endpoint', ''),
+            claw_eff.get('apiKey', ''),
+            claw_eff.get('model', '') or DEFAULT_PROFILE_ID,
+            [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            timeout=timeout_seconds,
+        )
+        parsed = extract_json_object(text) or {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        log_claw(f'Claw {stage} raw output:\n{text}')
+        return parsed, text
+
     try:
         log_claw(f'Starting run {run_id}. Goal: {cfg.get("goal", "")}'.strip())
-        log_claw(f"Execution policy: Codex is the primary author of product code inside the product folder; {claw_eff.get('profileName')} supervises, plans, researches, and coordinates.")
-        append_user_claw_message(product_id, 'claw', f"{claw_eff.get('profileName')} started run {run_id}. I will supervise Codex and keep the product state consistent.")
-        append_claw_codex_message(product_id, 'claw', f"Run {run_id} opened. Supervisor identity: {claw_eff.get('profileName')}.")
-        log_claw('Ensuring persistent Codex session exists.')
-        subprocess.run([str(ACPX), '--cwd', product_folder, 'codex', 'sessions', 'ensure', '--name', session_name], env=env, check=False, capture_output=True, text=True, timeout=120)
-
-        if codex.get('planMode'):
-            log_claw('Attempting to enable Codex plan mode (best effort).')
-            r = subprocess.run([str(ACPX), '--cwd', product_folder, 'codex', 'set-mode', 'plan', '--session', session_name], env=env, check=False, capture_output=True, text=True, timeout=120)
-            log_codex((r.stdout or '') + (('\n' + r.stderr) if r.stderr else ''))
-            if r.returncode != 0 or 'Invalid params' in ((r.stdout or '') + (r.stderr or '')):
-                log_claw('Codex plan mode is not supported by the current backend/session; continuing without enforced plan mode.')
-                append_claw_codex_message(product_id, 'claw', 'Plan-mode request was rejected by backend/session; continuing without forced plan mode.')
-
-        if codex.get('model'):
-            log_claw(f"Attempting to set Codex model to {codex['model']} (best effort).")
-            r = subprocess.run([str(ACPX), '--cwd', product_folder, 'codex', 'set', 'model', codex['model'], '--session', session_name], env=env, check=False, capture_output=True, text=True, timeout=120)
-            log_codex((r.stdout or '') + (('\n' + r.stderr) if r.stderr else ''))
-            if r.returncode != 0 or 'Invalid params' in ((r.stdout or '') + (r.stderr or '')):
-                log_claw('Codex model override was not accepted; proceeding with backend default.')
-
-        if codex.get('thinking'):
-            log_claw(f"Attempting to set Codex thinking to {codex['thinking']} (best effort).")
-            r = subprocess.run([str(ACPX), '--cwd', product_folder, 'codex', 'set', 'thinking', codex['thinking'], '--session', session_name], env=env, check=False, capture_output=True, text=True, timeout=120)
-            log_codex((r.stdout or '') + (('\n' + r.stderr) if r.stderr else ''))
-            if r.returncode != 0 or 'Invalid params' in ((r.stdout or '') + (r.stderr or '')):
-                log_claw('Codex thinking override was not accepted by the current backend; proceeding without explicit thinking override.')
-
+        log_claw(f"Execution policy: Claw is the product manager / planner / reviewer / acceptance lead; Codex is the implementation executor inside the product folder.")
+        append_user_claw_message(product_id, 'claw', f"{claw_eff.get('profileName')} started run {run_id}. I will plan, review, and decide delivery based on evidence while Codex implements.")
+        append_claw_codex_message(product_id, 'claw', f"Run {run_id} opened. Claw supervisor identity: {claw_eff.get('profileName')}.")
+        log_claw('Using one-shot Codex exec path with Claw-led plan/review loop.')
         if codex.get('maxPermission'):
             log_claw('Using approve-all permission mode for Codex runs.')
 
         st = load_product_state(product_id)
         user_context = summarize_user_claw_messages(st)
-        prompt = (
-            f"You are the implementation executor for task '{cfg.get('name')}'.\n"
-            f"Goal: {cfg.get('goal')}\n"
-            f"{claw_identity_block(cfg)}\n"
-            f"Additional user requests accumulated in the User↔Agent thread:\n{user_context}\n"
-            f"Work only inside: {product_folder}\n"
-            f"You are the primary author of product code and product files in that folder. Agent is not writing the main product code for you.\n"
-            f"If external information, networking, dataset download, or planning is needed, treat that as supervisor support context, but the actual product implementation work must be done by you inside the product folder.\n"
-            f"Produce a real deliverable in that folder if possible. If additional steps are needed, continue iteratively. When the product is actually delivered, include the exact token DELIVERED_OK. If it cannot be completed, include the exact token FAILED_FINAL and explain why."
-        )
-        cmd_prefix = [str(ACPX), '--cwd', product_folder]
+        progress_idle_grace = int(os.environ.get('TASKCAPTAIN_PROGRESS_IDLE_GRACE_SECONDS', '1800'))
+        progress_deadlock_guard = int(os.environ.get('TASKCAPTAIN_PROGRESS_DEADLOCK_SECONDS', '43200'))
+        progress_poll_seconds = float(os.environ.get('TASKCAPTAIN_PROGRESS_POLL_SECONDS', '2'))
+        cmd_prefix = [str(ACPX), '--cwd', product_folder, '--ttl', '30']
         if codex.get('maxPermission'):
             cmd_prefix += ['--approve-all', '--non-interactive-permissions', 'deny']
 
-        for turn in range(1, 6):
+        initial_snapshot = workspace_snapshot()
+        initial_files = workspace_material_files()
+        plan_prompt = (
+            f"Stage: initial_planning\n"
+            f"Product name: {cfg.get('name')}\n"
+            f"Goal: {cfg.get('goal')}\n"
+            f"User requests so far:\n{user_context}\n\n"
+            f"Current workspace snapshot:\n{initial_snapshot}\n\n"
+            "Return JSON with exactly these fields: decision, summary, phased_plan, acceptance_checks, codex_task, failure_reason.\n"
+            "- decision must be one of: delegate, deliver, fail\n"
+            "- phased_plan: list of short stage bullets\n"
+            "- acceptance_checks: list of concrete checks\n"
+            "- codex_task: the exact next implementation brief for Codex if decision=delegate\n"
+            "If the workspace is effectively empty, codex_task must force immediate file creation and a minimal runnable scaffold before polish."
+        )
+        plan, plan_raw = call_claw_json('plan', plan_prompt, timeout_seconds=120)
+        plan_decision = (plan.get('decision') or '').strip().lower()
+        acceptance_checks = plan.get('acceptance_checks') if isinstance(plan.get('acceptance_checks'), list) else []
+        phased_plan = plan.get('phased_plan') if isinstance(plan.get('phased_plan'), list) else []
+        if phased_plan:
+            append_user_claw_message(product_id, 'claw', 'Claw initial plan:\\n' + '\\n'.join(f'- {x}' for x in phased_plan[:8]))
+        if acceptance_checks:
+            append_user_claw_message(product_id, 'claw', 'Claw acceptance checks:\\n' + '\\n'.join(f'- {x}' for x in acceptance_checks[:8]))
+        if plan_decision == 'deliver':
+            set_state(status='delivered', stopRequested=False)
+            append_user_claw_message(product_id, 'claw', plan.get('summary') or 'Claw judged the product already delivered at planning stage.')
+            return
+        if plan_decision == 'fail':
+            set_state(status='failed', lastError=plan.get('failure_reason') or 'claw planning failed the task', stopRequested=False)
+            append_user_claw_message(product_id, 'claw', plan.get('summary') or 'Claw judged the task should fail at planning stage.')
+            return
+
+        current_codex_task = (plan.get('codex_task') or '').strip() or default_codex_task(1, initial_files)
+        last_codex_excerpt = ''
+
+        for turn in range(1, 9):
             if stop_event.is_set():
                 log_claw('Stop requested before next Codex turn. Marking stopped.')
                 append_user_claw_message(product_id, 'claw', f"{claw_eff.get('profileName')} stopped before dispatching the next Codex turn.")
                 set_state(status='stopped', stopRequested=True)
                 return
+
             set_state(status='running', stopRequested=False)
-            dispatch_text = prompt if turn == 1 else 'Continue from the current product context and any newly appended user requests. Agent remains the independent supervisor identity; Codex remains the primary code author. Either make further progress, deliver with DELIVERED_OK, or stop with FAILED_FINAL.'
-            log_claw(f'Dispatching Codex turn {turn}.')
-            append_claw_codex_message(product_id, 'claw', f"Dispatch turn {turn}. Supervisor brief:\n{dispatch_text[:2400]}")
-            run_cmd = cmd_prefix + ['codex', '--session', session_name, dispatch_text]
-            rc, out, was_stopped = run_codex_command(run_cmd, env, 1800, stop_event, product_id)
+            before_files = workspace_material_files()
+            before_snapshot = workspace_snapshot()
+            codex_dispatch = (
+                f"You are Codex, the implementation executor for task '{cfg.get('name')}'.\n"
+                f"Goal: {cfg.get('goal')}\n"
+                f"Work only inside: {product_folder}\n"
+                "Claw is your product manager and acceptance lead. Follow Claw's brief exactly.\n"
+                "Do real implementation work in files, not planning-only output.\n"
+                "Use bounded verification only; do not start long-lived servers or watchers.\n"
+                "Create and maintain a lightweight progress checkpoint at .taskcaptain/progress.json while you work.\n"
+                "That checkpoint should contain useful JSON such as current_stage, current_task, changed_files, blockers, and updated_at. Update it whenever you meaningfully progress.\n"
+                "If you are thinking for a long time, refresh the progress checkpoint before and after major substeps so the supervisor can distinguish healthy deep work from a stall.\n"
+                "At the end, reply with three short sections titled CHANGES, VERIFICATION, and REMAINING.\n\n"
+                f"Claw brief for this turn:\n{current_codex_task}\n"
+            )
+            log_claw(f'Dispatching Codex implementation turn {turn}.')
+            append_claw_codex_message(product_id, 'claw', f"Implementation turn {turn}. Claw brief:\n{current_codex_task[:3000]}")
+            run_cmd = cmd_prefix + ['codex', 'exec', codex_dispatch]
+            rc, out, was_stopped = run_codex_command(
+                run_cmd,
+                env,
+                None,
+                stop_event,
+                product_id,
+                progress_probe=workspace_progress_signature,
+                idle_grace_seconds=progress_idle_grace,
+                hard_deadlock_seconds=progress_deadlock_guard,
+                poll_seconds=progress_poll_seconds,
+            )
             log_codex(out)
             append_claw_codex_message(product_id, 'codex', out[-3000:])
             append_legacy_codex_conversation(product_id, out[-3000:])
             set_active_proc(product_id, None)
+            if out.strip():
+                last_codex_excerpt = out[-4000:]
+
             if was_stopped:
                 log_claw('Codex run stopped by user request. Marking stopped.')
                 append_user_claw_message(product_id, 'claw', f"{claw_eff.get('profileName')} confirmed the Codex run was stopped by user request.")
                 set_state(status='stopped', stopRequested=True)
                 return
-            if 'DELIVERED_OK' in out and rc == 0:
-                log_claw(f'Codex reported delivered on turn {turn}. Marking delivered.')
-                append_user_claw_message(product_id, 'claw', f"Codex reported delivery on turn {turn}. Product marked delivered.")
-                set_state(status='delivered', stopRequested=False)
+
+            after_files = workspace_material_files()
+            after_snapshot = workspace_snapshot()
+            file_delta = build_file_delta(before_files, after_files)
+            review_prompt = (
+                f"Stage: review_after_codex_turn\n"
+                f"Product name: {cfg.get('name')}\n"
+                f"Goal: {cfg.get('goal')}\n"
+                f"Turn: {turn}\n"
+                f"Known acceptance checks: {json.dumps(acceptance_checks, ensure_ascii=False)}\n\n"
+                f"Workspace snapshot before turn:\n{before_snapshot}\n\n"
+                f"Workspace snapshot after turn:\n{after_snapshot}\n\n"
+                f"Material file delta:\n{file_delta}\n\n"
+                f"Codex exit code: {rc}\n"
+                f"Progress idle grace seconds: {progress_idle_grace}\n"
+                f"Progress deadlock guard seconds: {progress_deadlock_guard}\n"
+                f"Workspace progress signature after turn: {json.dumps(workspace_progress_signature(), ensure_ascii=False)}\n"
+                f"Codex output excerpt:\n{last_codex_excerpt[-3000:]}\n\n"
+                "Return JSON with exactly these fields: decision, summary, evidence, next_codex_task, delivery_summary, failure_reason.\n"
+                "- decision must be one of: delegate, deliver, fail\n"
+                "- evidence must be a short list of concrete observations from files/logs/output\n"
+                "- next_codex_task must be the next specific implementation brief if decision=delegate\n"
+                "- deliver only if the workspace now has a demonstrable deliverable and the evidence supports it\n"
+                "- fail if progress is blocked or evidence shows the goal cannot be met reasonably"
+            )
+            review, review_raw = call_claw_json('review', review_prompt, timeout_seconds=120)
+            decision = (review.get('decision') or '').strip().lower()
+            summary = (review.get('summary') or '').strip()
+            evidence = review.get('evidence') if isinstance(review.get('evidence'), list) else []
+            if summary:
+                append_user_claw_message(product_id, 'claw', f"Turn {turn} review: {summary}")
+            if evidence:
+                append_user_claw_message(product_id, 'claw', 'Evidence:\\n' + '\\n'.join(f'- {x}' for x in evidence[:8]))
+
+            if decision == 'deliver':
+                delivery_summary = (review.get('delivery_summary') or summary or 'Claw judged the product delivered based on workspace evidence.').strip()
+                log_claw(f'Claw marked product delivered on turn {turn}.')
+                append_user_claw_message(product_id, 'claw', delivery_summary)
+                set_state(status='delivered', lastError=None, stopRequested=False)
                 return
-            if 'FAILED_FINAL' in out:
-                log_claw(f'Codex reported final failure on turn {turn}. Marking failed.')
-                append_user_claw_message(product_id, 'claw', f"Codex declared final failure on turn {turn}. Product marked failed.")
-                set_state(status='failed', lastError='codex declared final failure', stopRequested=False)
+            if decision == 'fail':
+                failure_reason = (review.get('failure_reason') or summary or 'Claw marked the task failed after review.').strip()
+                log_claw(f'Claw marked product failed on turn {turn}: {failure_reason}')
+                append_user_claw_message(product_id, 'claw', failure_reason)
+                set_state(status='failed', lastError=failure_reason, stopRequested=False)
                 return
-            if rc != 0:
-                log_claw(f'Codex returned non-zero exit on turn {turn} ({rc}).')
-                append_user_claw_message(product_id, 'claw', f"Codex turn {turn} returned non-zero exit {rc}. Agent will retry if budget remains.")
-                if turn >= 5:
-                    set_state(status='failed', lastError=f'codex exit {rc}', stopRequested=False)
-                    return
-                time.sleep(2)
-                continue
-            append_user_claw_message(product_id, 'claw', f"Codex turn {turn} completed without terminal token. Agent is continuing supervision.")
-            log_claw(f'Codex turn {turn} completed without terminal token; continuing supervision loop.')
+
+            next_task = (review.get('next_codex_task') or '').strip()
+            if not next_task:
+                next_task = default_codex_task(turn + 1, after_files)
+                log_claw(f'Claw review did not provide next_codex_task on turn {turn}; using fallback task.')
+            current_codex_task = next_task
+            set_state(status='running', stopRequested=False, lastError=f'awaiting next iteration after turn {turn}')
             time.sleep(2)
 
-        log_claw('Reached supervision turn limit without delivery/final failure. Marking failed for now.')
-        append_user_claw_message(product_id, 'claw', 'Supervision turn limit reached without delivery or final failure. Product marked failed for now.')
-        set_state(status='failed', lastError='turn limit reached without terminal result', stopRequested=False)
+        log_claw('Reached Claw supervision turn limit without delivery/final failure. Marking failed for now.')
+        append_user_claw_message(product_id, 'claw', 'Claw supervision turn limit reached without delivery or final failure. Product marked failed for now.')
+        set_state(status='failed', lastError='claw supervision turn limit reached', stopRequested=False)
     except Exception as e:
         log_claw(f'Run failed with exception: {e}')
         append_user_claw_message(product_id, 'claw', f'Run failed with exception: {e}')
         set_state(status='failed', lastError=str(e), stopRequested=False)
     finally:
         clear_active_run(product_id)
-
 
 def language_switch_html(current_lang: str, base_path: str) -> str:
     return f"""
@@ -1533,7 +1942,7 @@ class Handler(BaseHTTPRequestHandler):
           </div>
           <div>
             <label class='{label_cls} text-sm'>{html.escape(t(lang, 'product_folder'))}</label>
-            <input name='productFolder' value='{html.escape(DEFAULT_PRODUCT_FOLDER)}' class='{input_cls}' />
+            <input name='productFolder' value='' placeholder='{html.escape(DEFAULT_PRODUCT_FOLDER)}' class='{input_cls}' />
           </div>
           
           <div class='bg-slate-50/50 dark:bg-zinc-800/30 border border-slate-200 dark:border-zinc-800 rounded-xl p-4 space-y-3'>
