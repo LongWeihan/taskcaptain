@@ -927,24 +927,70 @@ def run_self_test(product_id: str) -> None:
         save_product_state(product_id, st)
 
     def run_selftest_command(cmd: list[str], timeout_seconds: int) -> tuple[int | None, str, bool]:
+        # Stream stdout/stderr into codex.log while the command is running (better UX vs waiting for communicate()).
         proc = None
         try:
-            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                bufsize=1,
+            )
             info = active_self_test_info(product_id)
             if info is not None:
                 info.setdefault('procs', []).append(proc)
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout_seconds)
-                out = (stdout or '') + (('\n' + stderr) if stderr else '')
-                return proc.returncode, out, False
-            except subprocess.TimeoutExpired:
-                terminate_process_tree(proc)
+
+            io_lock = threading.Lock()
+            stdout_chunks: list[str] = []
+            stderr_chunks: list[str] = []
+
+            def reader(stream, chunks: list[str], key: str):
                 try:
-                    stdout, stderr = proc.communicate(timeout=5)
-                except Exception:
-                    stdout, stderr = '', ''
-                out = (stdout or '') + (('\n' + stderr) if stderr else '')
-                return None, out, True
+                    while True:
+                        line = stream.readline()
+                        if line == '':
+                            break
+                        with io_lock:
+                            chunks.append(line)
+                        try:
+                            if key == 'stdout':
+                                log_codex(line.rstrip())
+                            else:
+                                log_codex('[stderr] ' + line.rstrip())
+                        except Exception:
+                            pass
+                except Exception as e:
+                    with io_lock:
+                        chunks.append(f"\n[taskcaptain {key} reader error] {e}\n")
+
+            t_out = threading.Thread(target=reader, args=(proc.stdout, stdout_chunks, 'stdout'), daemon=True)
+            t_err = threading.Thread(target=reader, args=(proc.stderr, stderr_chunks, 'stderr'), daemon=True)
+            t_out.start()
+            t_err.start()
+
+            def combined_output() -> str:
+                with io_lock:
+                    stdout = ''.join(stdout_chunks)
+                    stderr = ''.join(stderr_chunks)
+                return stdout + (("\n" + stderr) if stderr else '')
+
+            start_ts = time.time()
+            while True:
+                if proc.poll() is not None:
+                    t_out.join(timeout=2)
+                    t_err.join(timeout=2)
+                    return proc.returncode, combined_output(), False
+
+                if timeout_seconds is not None and time.time() - start_ts > timeout_seconds:
+                    terminate_process_tree(proc)
+                    t_out.join(timeout=2)
+                    t_err.join(timeout=2)
+                    return None, combined_output(), True
+
+                time.sleep(0.2)
         finally:
             if proc is not None:
                 info = active_self_test_info(product_id)
@@ -968,7 +1014,7 @@ def run_self_test(product_id: str) -> None:
 
         session_cmd = [str(ACPX), '--cwd', product_folder, 'codex', 'sessions', 'ensure', '--name', session_name]
         rc, out, timed_out = run_selftest_command(session_cmd, 45)
-        log_codex(out)
+        log_codex(f'[taskcaptain] self-test command finished: codex_session rc={rc} timedOut={timed_out}')
         if timed_out:
             checks['codex_session'] = {'ok': False, 'detail': f'timed out after 45 seconds: {" ".join(session_cmd)}'}
         else:
@@ -977,7 +1023,7 @@ def run_self_test(product_id: str) -> None:
 
         status_cmd = [str(ACPX), '--cwd', product_folder, 'codex', 'status', '--session', session_name]
         rc, out, timed_out = run_selftest_command(status_cmd, 20)
-        log_codex(out)
+        log_codex(f'[taskcaptain] self-test command finished: codex_status rc={rc} timedOut={timed_out}')
         if timed_out:
             checks['codex_status'] = {'ok': False, 'detail': f'timed out after 20 seconds: {" ".join(status_cmd)}'}
         else:
@@ -992,7 +1038,7 @@ def run_self_test(product_id: str) -> None:
 
         prompt_cmd = [str(ACPX), '--cwd', product_folder, '--approve-all', '--non-interactive-permissions', 'deny', 'codex', 'exec', 'Reply with exactly SELFTEST_CODEX_OK']
         rc, out, timed_out = run_selftest_command(prompt_cmd, 60)
-        log_codex(out)
+        log_codex(f'[taskcaptain] self-test command finished: codex_prompt rc={rc} timedOut={timed_out}')
         if timed_out:
             checks['codex_prompt'] = {'ok': False, 'detail': f'timed out after 60 seconds: {" ".join(prompt_cmd)}'}
         else:
