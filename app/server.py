@@ -1023,6 +1023,8 @@ def run_codex_command(
     stop_event: threading.Event,
     product_id: str,
     progress_probe=None,
+    on_stdout_line=None,
+    on_stderr_line=None,
     idle_grace_seconds: int = 1800,
     hard_deadlock_seconds: int | None = 43200,
     poll_seconds: float = 2.0,
@@ -1044,6 +1046,13 @@ def run_codex_command(
                 with io_lock:
                     chunks.append(line)
                     activity[key] = time.time()
+                try:
+                    if key == 'stdout' and on_stdout_line is not None:
+                        on_stdout_line(line)
+                    if key == 'stderr' and on_stderr_line is not None:
+                        on_stderr_line(line)
+                except Exception:
+                    pass
         except Exception as e:
             with io_lock:
                 chunks.append(f'\n[taskcaptain {key} reader error] {e}\n')
@@ -1151,6 +1160,21 @@ def extract_json_object(text: str) -> dict | None:
         if isinstance(obj, dict):
             return obj
     return None
+
+
+
+def stringify_for_log(value) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        try:
+            return str(value)
+        except Exception:
+            return ''
 
 
 def build_chat_completions_url(base: str) -> str:
@@ -1607,11 +1631,13 @@ def run_supervision_loop(product_id: str, run_id: str, stop_event: threading.Eve
                 stop_event,
                 product_id,
                 progress_probe=workspace_progress_signature,
+                on_stdout_line=lambda line: append_log(codex_log, f'[{now_iso()}] ' + line.rstrip()),
+                on_stderr_line=lambda line: append_log(codex_log, f'[{now_iso()}] [stderr] ' + line.rstrip()),
                 idle_grace_seconds=progress_idle_grace,
                 hard_deadlock_seconds=progress_deadlock_guard,
                 poll_seconds=progress_poll_seconds,
             )
-            log_codex(out)
+            log_codex(f'[taskcaptain] codex exec finished rc={rc} stopped={was_stopped}')
             append_claw_codex_message(product_id, 'codex', out[-3000:])
             append_legacy_codex_conversation(product_id, out[-3000:])
             set_active_proc(product_id, None)
@@ -1664,7 +1690,7 @@ def run_supervision_loop(product_id: str, run_id: str, stop_event: threading.Eve
                 append_user_claw_message(product_id, 'claw', 'Evidence:\\n' + '\\n'.join(f'- {x}' for x in evidence[:8]))
 
             if decision == 'deliver':
-                delivery_summary = (review.get('delivery_summary') or summary or 'Claw judged the product delivered based on workspace evidence.').strip()
+                delivery_summary = (stringify_for_log(review.get('delivery_summary')) or summary or 'Claw judged the product delivered based on workspace evidence.').strip()
                 log_claw(f'Claw marked product delivered on turn {turn}.')
                 append_user_claw_message(product_id, 'claw', delivery_summary)
                 set_state(status='delivered', lastError=None, stopRequested=False)
