@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import threading
@@ -27,6 +28,8 @@ CLAW_PROFILES = DATA / 'claw-profiles'
 RUNS = ROOT / 'runs'
 DEFAULT_ACPX = '/home/a/.openclaw/extensions/acpx/node_modules/.bin/acpx'
 ACPX = Path(os.environ.get('ACPX_BIN', DEFAULT_ACPX))
+
+CODEX_ACP_BIN = os.environ.get('CODEX_ACP_BIN', '/home/a/.npm/_npx/e3854e347c184741/node_modules/.bin/codex-acp').strip()
 
 HOST = os.environ.get('PRODUCTS_UI_HOST', '127.0.0.1')
 PORT = int(os.environ.get('PRODUCTS_UI_PORT', '8765'))
@@ -1036,7 +1039,18 @@ def run_self_test(product_id: str) -> None:
                 checks['codex_status'] = {'ok': False, 'detail': detail}
         log_claw(f"Self-test codex_status: {checks['codex_status']['ok']}")
 
-        prompt_cmd = [str(ACPX), '--cwd', product_folder, '--approve-all', '--non-interactive-permissions', 'deny', 'codex', 'exec', 'Reply with exactly SELFTEST_CODEX_OK']
+        effort = normalize_effort(codex.get('thinking'))
+        agent_tokens = [CODEX_ACP_BIN] if CODEX_ACP_BIN else []
+        if codex.get('model'):
+            agent_tokens += ['-c', f"model=\"{codex.get('model')}\""]
+        if effort:
+            agent_tokens += ['-c', f"model_reasoning_effort=\"{effort}\""]
+        agent_cmd = ' '.join(shlex.quote(x) for x in agent_tokens) if agent_tokens else ''
+        if agent_cmd:
+            prompt_cmd = [str(ACPX), '--cwd', product_folder, '--approve-all', '--non-interactive-permissions', 'deny', '--agent', agent_cmd, 'exec', 'Reply with exactly SELFTEST_CODEX_OK']
+        else:
+            prompt_cmd = [str(ACPX), '--cwd', product_folder, '--approve-all', '--non-interactive-permissions', 'deny', 'codex', 'exec', 'Reply with exactly SELFTEST_CODEX_OK']
+
         rc, out, timed_out = run_selftest_command(prompt_cmd, 60)
         log_codex(f'[taskcaptain] self-test command finished: codex_prompt rc={rc} timedOut={timed_out}')
         if timed_out:
@@ -1221,6 +1235,67 @@ def stringify_for_log(value) -> str:
             return str(value)
         except Exception:
             return ''
+
+
+
+def normalize_effort(value: str | None) -> str | None:
+    v = (value or '').strip().lower()
+    if v in {'low', 'medium', 'high', 'xhigh'}:
+        return v
+    return None
+
+
+def build_responses_url(base: str) -> str:
+    base = (base or '').rstrip('/')
+    if not base:
+        return ''
+    if base.endswith('/responses'):
+        return base
+    return f'{base}/responses'
+
+
+def parse_responses_output_text(parsed: dict) -> str:
+    if isinstance(parsed.get('output_text'), str):
+        return parsed.get('output_text') or ''
+    out = parsed.get('output')
+    if isinstance(out, list):
+        parts: list[str] = []
+        for item in out:
+            if not isinstance(item, dict):
+                continue
+            content = item.get('content')
+            if not isinstance(content, list):
+                continue
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get('type') in {'output_text', 'text'}:
+                    t = c.get('text')
+                    if isinstance(t, str):
+                        parts.append(t)
+        return ''.join(parts)
+    return ''
+
+
+def openai_responses(base_url: str, api_key: str | None, model: str, input_text: str, reasoning_effort: str | None = None, timeout: int = 120) -> tuple[str, dict]:
+    url = build_responses_url(base_url)
+    if not url:
+        raise RuntimeError('missing responses base url')
+    headers = {'Content-Type': 'application/json'}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+    payload: dict = {
+        'model': model,
+        'input': input_text,
+        'stream': False,
+    }
+    if reasoning_effort:
+        payload['reasoning'] = {'effort': reasoning_effort}
+    req = Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+    with urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode('utf-8', 'ignore')
+    parsed = json.loads(body)
+    return parse_responses_output_text(parsed), parsed
 
 
 def build_chat_completions_url(base: str) -> str:
@@ -1558,16 +1633,32 @@ def run_supervision_loop(product_id: str, run_id: str, stop_event: threading.Eve
             "Be strict and evidence-based. Do not declare delivery unless the workspace and verification evidence justify it.\n"
             "Respond with JSON only, no markdown fences."
         )
-        text, _ = openai_chat_completion(
-            claw_eff.get('endpoint', ''),
-            claw_eff.get('apiKey', ''),
-            claw_eff.get('model', '') or DEFAULT_PROFILE_ID,
-            [
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': user_prompt},
-            ],
-            timeout=timeout_seconds,
-        )
+        effort = normalize_effort(claw_eff.get('thinking'))
+        # Prefer /responses so reasoning.effort can take effect; fall back to /chat/completions if needed.
+        try:
+            combined_input = system_prompt + '\n\n' + user_prompt
+            text, raw = openai_responses(
+                claw_eff.get('endpoint', ''),
+                claw_eff.get('apiKey', ''),
+                claw_eff.get('model', '') or DEFAULT_PROFILE_ID,
+                combined_input,
+                reasoning_effort=effort,
+                timeout=timeout_seconds,
+            )
+        except Exception:
+            text, raw = openai_chat_completion(
+                claw_eff.get('endpoint', ''),
+                claw_eff.get('apiKey', ''),
+                claw_eff.get('model', '') or DEFAULT_PROFILE_ID,
+                [
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_prompt},
+                ],
+                timeout=timeout_seconds,
+            )
+        usage = raw.get('usage') if isinstance(raw, dict) else None
+        if usage:
+            log_claw(f"Claw {stage} usage: {json.dumps(usage, ensure_ascii=False)}")
         parsed = extract_json_object(text) or {}
         if not isinstance(parsed, dict):
             parsed = {}
@@ -1669,7 +1760,18 @@ def run_supervision_loop(product_id: str, run_id: str, stop_event: threading.Eve
             )
             log_claw(f'Dispatching Codex implementation turn {turn}.')
             append_claw_codex_message(product_id, 'claw', f"Implementation turn {turn}. Claw brief:\n{current_codex_task[:3000]}")
-            run_cmd = cmd_prefix + ['codex', 'exec', codex_dispatch]
+            effort = normalize_effort(codex.get('thinking'))
+            agent_tokens = [CODEX_ACP_BIN] if CODEX_ACP_BIN else []
+            if codex.get('model'):
+                agent_tokens += ['-c', f"model=\"{codex.get('model')}\""]
+            if effort:
+                agent_tokens += ['-c', f"model_reasoning_effort=\"{effort}\""]
+            agent_cmd = ' '.join(shlex.quote(x) for x in agent_tokens) if agent_tokens else ''
+            if agent_cmd:
+                run_cmd = cmd_prefix + ['--agent', agent_cmd, 'exec', codex_dispatch]
+            else:
+                run_cmd = cmd_prefix + ['codex', 'exec', codex_dispatch]
+
             rc, out, was_stopped = run_codex_command(
                 run_cmd,
                 env,
@@ -2022,6 +2124,30 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             self.redirect(f'/?lang={lang}')
             return
+        if parsed.path.startswith('/set-claw-thinking/'):
+            pid = parsed.path.split('/')[-1]
+            cfg = load_product_config(pid)
+            v = (form.get('thinking') or '').strip().lower()
+            if v and v not in {'low', 'medium', 'high', 'xhigh'}:
+                v = ''
+            cfg.setdefault('claw', {})['thinking'] = v
+            save_product_config(pid, cfg)
+            append_log(product_dir(pid) / 'logs' / 'claw.log', f"[{now_iso()}] Updated claw thinking/effort to {v or '(inherit)'} via UI.")
+            self.redirect(f'/product/{pid}?lang={lang}')
+            return
+
+        if parsed.path.startswith('/set-codex-thinking/'):
+            pid = parsed.path.split('/')[-1]
+            cfg = load_product_config(pid)
+            v = (form.get('thinking') or '').strip().lower()
+            if v and v not in {'low', 'medium', 'high', 'xhigh'}:
+                v = 'medium'
+            cfg.setdefault('codex', {})['thinking'] = v
+            save_product_config(pid, cfg)
+            append_log(product_dir(pid) / 'logs' / 'claw.log', f"[{now_iso()}] Updated codex thinking/effort to {v} via UI.")
+            self.redirect(f'/product/{pid}?lang={lang}')
+            return
+
         if parsed.path.startswith('/set-max-turns/'):
             pid = parsed.path.split('/')[-1]
             cfg = load_product_config(pid)
@@ -2234,7 +2360,14 @@ class Handler(BaseHTTPRequestHandler):
                 </div>
                 <div class='grid grid-cols-2 gap-3'>
                   <div><label class='{label_cls}'>{html.escape(t(lang, 'claw_model'))}</label><input name='clawModel' placeholder='{html.escape(default_profile.get('model', ''))}' class='{input_cls}' /></div>
-                  <div><label class='{label_cls}'>{html.escape(t(lang, 'claw_thinking'))}</label><input name='clawThinking' placeholder='{html.escape(default_profile.get('thinking', ''))}' class='{input_cls}' /></div>
+                  <div><label class='{label_cls}'>{html.escape(t(lang, 'claw_thinking'))}</label>
+                    <select name='clawThinking' class='{input_cls}'>
+                      <option value=''>inherit({html.escape(default_profile.get('thinking',''))})</option>
+                      <option value='low'>low</option>
+                      <option value='medium'>medium</option>
+                      <option value='high'>high</option>
+                      <option value='xhigh'>xhigh</option>
+                    </select></div>
                 </div>
                 <div><label class='{label_cls}'>{html.escape(t(lang, 'claw_soul'))}</label><textarea name='clawSoul' rows='2' placeholder='{html.escape(t(lang, 'profile_soul_placeholder'))}' class='{input_cls}'></textarea></div>
                 <div><label class='{label_cls}'>{html.escape(t(lang, 'claw_skills'))}</label><textarea name='clawSkills' rows='2' placeholder='{html.escape(t(lang, 'profile_skills_placeholder'))}' class='{input_cls}'></textarea></div>
@@ -2250,7 +2383,13 @@ class Handler(BaseHTTPRequestHandler):
             </div>
             <div class='grid grid-cols-2 gap-3'>
               <div><label class='{label_cls}'>{html.escape(t(lang, 'codex_model'))}</label><input name='codexModel' value='gpt-5.4-medium' class='{input_cls}' /></div>
-              <div><label class='{label_cls}'>{html.escape(t(lang, 'codex_thinking'))}</label><input name='codexThinking' value='medium' class='{input_cls}' /></div>
+              <div><label class='{label_cls}'>{html.escape(t(lang, 'codex_thinking'))}</label>
+                  <select name='codexThinking' class='{input_cls}'>
+                    <option value='low'>low</option>
+                    <option value='medium' selected>medium</option>
+                    <option value='high'>high</option>
+                    <option value='xhigh'>xhigh</option>
+                  </select></div>
             </div>
             <div class='flex gap-4 mt-2'>
               <label class='flex items-center gap-2 text-sm font-medium cursor-pointer'>
@@ -2363,6 +2502,20 @@ class Handler(BaseHTTPRequestHandler):
       <ul class='text-sm space-y-2'>
         <li><b class='text-slate-700 dark:text-slate-300'>{html.escape(t(lang, 'profile_label'))}:</b> {html.escape(claw_eff.get('profileName', ''))}</li>
         <li><b class='text-slate-700 dark:text-slate-300'>{html.escape(t(lang, 'model'))}:</b> {html.escape(claw_eff.get('model', ''))} <span class='text-slate-400'>({html.escape(claw_eff.get('thinking', ''))})</span></li>
+        <li>
+          <b class='text-slate-700 dark:text-slate-300'>{html.escape(t(lang, 'claw_thinking'))}:</b>
+          <form method='post' action='/set-claw-thinking/{html.escape(pid)}' class='inline-flex items-center gap-2 ml-2 align-middle'>
+            <input type='hidden' name='lang' value='{html.escape(lang)}' />
+            <select name='thinking' class='bg-slate-50 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition'>
+              <option value=''>inherit({html.escape(profile.get('thinking',''))})</option>
+              <option value='low' {'selected' if (claw_eff.get('thinking')=='low') else ''}>low</option>
+              <option value='medium' {'selected' if (claw_eff.get('thinking')=='medium') else ''}>medium</option>
+              <option value='high' {'selected' if (claw_eff.get('thinking')=='high') else ''}>high</option>
+              <option value='xhigh' {'selected' if (claw_eff.get('thinking')=='xhigh') else ''}>xhigh</option>
+            </select>
+            <button type='submit' class='px-2.5 py-1 text-xs font-semibold bg-white dark:bg-zinc-800 border border-slate-200 dark:border-zinc-700 rounded-lg hover:bg-slate-50 dark:hover:bg-zinc-700 transition'>保存</button>
+          </form>
+        </li>
         <li><b class='text-slate-700 dark:text-slate-300'>{html.escape(t(lang, 'api_key_present'))}:</b> <span class='{'text-emerald-600 bg-emerald-50 dark:bg-emerald-900/30' if claw_eff.get('apiKey') else 'text-red-600 bg-red-50 dark:bg-red-900/30'} px-1.5 rounded text-xs'>{html.escape(t(lang, mask_present(claw_eff.get('apiKey'))))}</span></li>
         <li class='font-mono text-xs text-slate-500 mt-1 break-all'>{html.escape(claw_eff.get('endpoint', ''))}</li>
       </ul>
@@ -2371,6 +2524,19 @@ class Handler(BaseHTTPRequestHandler):
       <h4 class='text-xs font-bold text-slate-400 uppercase tracking-wider mb-2'>{html.escape(t(lang, 'codex_setting'))}</h4>
       <ul class='text-sm space-y-2'>
         <li><b class='text-slate-700 dark:text-slate-300'>{html.escape(t(lang, 'model'))}:</b> {html.escape(cfg.get('codex', {}).get('model', ''))} <span class='text-slate-400'>({html.escape(cfg.get('codex', {}).get('thinking', ''))})</span></li>
+        <li>
+          <b class='text-slate-700 dark:text-slate-300'>{html.escape(t(lang, 'codex_thinking'))}:</b>
+          <form method='post' action='/set-codex-thinking/{html.escape(pid)}' class='inline-flex items-center gap-2 ml-2 align-middle'>
+            <input type='hidden' name='lang' value='{html.escape(lang)}' />
+            <select name='thinking' class='bg-slate-50 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition'>
+              <option value='low' {'selected' if (cfg.get('codex', {}).get('thinking')=='low') else ''}>low</option>
+              <option value='medium' {'selected' if (cfg.get('codex', {}).get('thinking')=='medium') else ''}>medium</option>
+              <option value='high' {'selected' if (cfg.get('codex', {}).get('thinking')=='high') else ''}>high</option>
+              <option value='xhigh' {'selected' if (cfg.get('codex', {}).get('thinking')=='xhigh') else ''}>xhigh</option>
+            </select>
+            <button type='submit' class='px-2.5 py-1 text-xs font-semibold bg-white dark:bg-zinc-800 border border-slate-200 dark:border-zinc-700 rounded-lg hover:bg-slate-50 dark:hover:bg-zinc-700 transition'>保存</button>
+          </form>
+        </li>
         <li><b class='text-slate-700 dark:text-slate-300'>{html.escape(t(lang, 'api_key_present'))}:</b> <span class='{'text-emerald-600 bg-emerald-50 dark:bg-emerald-900/30' if cfg.get('codex', {}).get('apiKey') else 'text-red-600 bg-red-50 dark:bg-red-900/30'} px-1.5 rounded text-xs'>{html.escape(t(lang, mask_present(cfg.get('codex', {}).get('apiKey'))))}</span></li>
         <li class='font-mono text-xs text-slate-500 mt-1 break-all'>{html.escape(cfg.get('codex', {}).get('endpoint', ''))}</li>
         <li>
