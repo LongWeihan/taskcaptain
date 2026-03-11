@@ -4,38 +4,117 @@
 ![TaskCaptain hero](./hero2.png)
 
 <div align="center">
-  
-# TaskCaptain: 
+Claw 负责想，Codex 负责写，你负责睡。
+</br>
+<em>Claw vibes. Codex codes. You sleep.</em>
 
-**把目标变成持续执行，直到交付结果。**
-<a href="https://openclaw.ai/" target="_blank"><img src="./openclaw_logo.png" alt="LongWeihan/taskcaptain | OpenClaw" height="40"/></a>
+<a href="https://openclaw.ai/" target="_blank"><img src="./openclaw_logo.png" alt="LongWeihan/taskcaptain | OpenClaw" height="60"/></a>
   
 [![GitHub Stars](https://img.shields.io/github/stars/LongWeihan/taskcaptain?style=flat-square&color=DAA520)](https://github.com/LongWeihan/taskcaptain/stargazers)
 [![GitHub Watchers](https://img.shields.io/github/watchers/LongWeihan/taskcaptain?style=flat-square)](https://github.com/LongWeihan/taskcaptain/watchers)
 [![GitHub Forks](https://img.shields.io/github/forks/LongWeihan/taskcaptain?style=flat-square)](https://github.com/LongWeihan/taskcaptain/network)
-[![OpenClaw](https://img.shields.io/badge/OpenClaw-Required-blue?style=flat-square)](https://github.com/openclaw/openclaw)
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
-![License](https://img.shields.io/badge/开源协议-MIT-yellow?style=flat-square)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/LongWeihan/taskcaptain)
 
-
-TaskCaptain 是面向 Codex 的本地任务执行控制台：
-它把 **User ↔ Agent**、**Agent ↔ Codex**、**执行日志** 明确拆开，让任务推进过程可见、可控、可追踪。
+![MIT License](https://img.shields.io/badge/License-MIT-111827?style=flat-square)
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)
+![macOS Linux](https://img.shields.io/badge/macOS%20%7C%20Linux-Supported-1F2937?style=flat-square)
 
 [English](./README-EN.md) · [用户指南](./docs/USER_GUIDE.md) · [部署说明](./docs/DEPLOYMENT.md)
 
 
+</div>
 
----
 
-## 概述
+⚡ 项目概述
+------
 
-TaskCaptain 不是一个普通聊天界面。
+**TaskCaptain** 是一个以 OpenClaw 为内核的监督式执行平台。它重构了 vibe coding 的主语：不再是人类对着聊天框一点点提修改，而由智能体在真实工作区中持续规划、执行、审查与推进任务，人类则只需要设定一次目标。通过将用户控制、Agent 监督、执行器落地与原始日志拆分为清晰可见的执行链路，TaskCaptain 让任务变成一场全自动驾驶体验——**你不再需要 vibe coding，OpenClaw 将自主指挥一切**。
 
-它的定位是：**接管任务推进，持续驱动 Codex 执行，并把状态、对话和日志保留在一个可检查的本地工作台里。**
+> 你只需：描述想要交付什么，并在过程中随时用自然语言修正任务方向</br>
+> TaskCaptain 将返回：一条可持续运行的监督式执行链路，以及完整保留规划、执行、审查与日志证据的任务记录
 
-对于需要持续推进、反复迭代、随时插入新约束的任务，TaskCaptain 提供的是一个更接近“执行控制台”的工作方式，而不是一次性回答。
+### 我们的愿景
 
----
+TaskCaptain 致力于把 AI coding 从“聊天式生成”推进到“监督式执行”，通过显式拆分人类、监督 Agent 与实现执行器的职责边界，突破传统 coding agent 在可控性、可见性与可靠性上的局限：
+*   **于工程实践**：我们是开发者的本地指挥台，让长任务执行、过程审查、故障复盘与中途变更都能在一个透明闭环中完成
+*   **于 agent 未来**：我们是 agent software engineering 的早期范式，智能体不再只是回答问题，而在人的指挥下承担真实的软件生产责任
+
+## 📸 系统截图
+
+
+<div align="center">
+<table>
+<tr>
+<td><img width="400" height="400" alt="image" src="https://github.com/user-attachments/assets/bf3c510a-e9b3-42b4-a2b1-5ecfeb93f3eb" />
+</td>
+<td><img width="400" height="400" alt="image" src="https://github.com/user-attachments/assets/b85480c3-e14e-4b7f-8c2c-23a4049d31fa" />
+</td>
+</tr>
+<tr>
+<td><img width="400" height="400" alt="image" src="https://github.com/user-attachments/assets/6487019a-620c-4296-b605-bd92668e6c92" />
+</td>
+<td><img width="400" height="400" alt="image" src="https://github.com/user-attachments/assets/d037ee6e-f620-499e-8257-5944249580cc" />
+</td>
+</tr>
+</table>
+</div>
+
+
+## 🏭 演示项目
+
+### 1. 本地库存采购联动台
+一句话：
+```
+做一个本地库存采购联动台。界面精美。其他的自己想
+```
+<div align="center">
+  <img src="./交付产品演示.gif" width="800" alt="项目演示动画" />
+</div>
+
+### 2. 优化 softmax 性能
+一句话：
+```
+梳理目前softmax优化版本的sota，设计能超过当前sota的softmax优化版本，你自己运行并给出结果的对比。我的电脑是7950x+128g+4060ti16g
+```
+<div align="center">
+
+### 按 `N` 聚合后的中位 speedup（candidate vs torch）
+
+|场景|N=128|256|512|1024|2048|4096|
+| --- | --- | --- | --- | --- | --- | --- |
+|`fp16 / none`|0.38x|0.55x|0.27x|1.41x|**2.87x**|1.02x|
+|`bf16 / none`|0.39x|0.55x|0.48x|1.40x|**2.39x**|1.03x|
+|`fp16 / pad`|0.78x|1.13x|2.00x|3.07x|**3.72x**|2.40x|
+|`bf16 / pad`|0.80x|1.18x|2.00x|3.04x|**3.38x**|2.44x|
+
+
+</div>
+
+### 2. a股交易策略与回测
+一句话：
+```
+设计一套专家级a股交易策略，并对真实历史数据完成回测。年化收益要够高，也要足够稳健，让我真的能赚到钱
+```
+<div align="center">
+
+<img width="500" height="500" alt="equity" src="https://github.com/user-attachments/assets/93bb2318-cd19-4634-87f6-9b315a3e9ebe" />
+
+
+### 策略与基准核心表现对比表（2017-2024）
+
+| 维度 | 指标 | 本策略 (Expert) | 沪深300基准 |
+| --- | --- | --- | --- |
+| 资金概况 | 初始投入 | 1,000,000 元 | 1,000,000 元 |
+|  | 期末总资金 | 2,334,288 元 | 1,177,331 元 |
+|  | 累计净赚（利润） | +1,334,288 元 | +177,331 元 |
+| 收益能力 | 年化收益率 | 11.63% | 2.14% |
+| 风险控制 | 最大回撤 | -21.08% | -45.60% |
+| 综合性价比 | 夏普比率 | 0.79 | 0.11 |
+
+
+</div>
+
+> **一键可邮件注册论坛搭建**、**llama2.c优化**等示例陆续更新中...
 
 ## 核心能力
 
@@ -302,3 +381,17 @@ TaskCaptain 当前定位为**可信本地环境中的本地控制台**。
 ## License
 
 本项目采用 [MIT License](./LICENSE)。
+
+## 📄 致谢
+
+**TaskCaptain 得到了 Ramen 集团的战略支持和孵化！** 我们衷心感谢 Ramen 的技术支持！
+
+## 📈 项目统计
+
+<a href="https://star-history.com/#LongWeihan/taskcaptain&type=date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date" />
+ </picture>
+</a>
