@@ -392,5 +392,19 @@ TaskCaptain 当前定位为**可信本地环境中的本地控制台**。
 **TaskCaptain 得到了 Ramen 集团的战略支持和孵化！** 我们衷心感谢 Ramen 的技术支持！
 
 ## 📈 项目统计
-
-![Star History Light](https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date#gh-light-mode-only)
+<a href="https://star-history.com/#LongWeihan/taskcaptain&type=date">
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date&theme=dark&v=20260312"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date&v=20260312"
+    />
+    <img
+      alt="Star History Chart"
+      src="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date&v=20260312"
+    />
+  </picture>
+</a>
