@@ -393,10 +393,4 @@ TaskCaptain 当前定位为**可信本地环境中的本地控制台**。
 
 ## 📈 项目统计
 
-<a href="https://star-history.com/#LongWeihan/taskcaptain&type=date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date" />
- </picture>
-</a>
+![Star History Light](https://api.star-history.com/svg?repos=LongWeihan/taskcaptain&type=date#gh-light-mode-only)
