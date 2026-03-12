@@ -128,6 +128,13 @@ Design an expert-level A-share trading strategy and perform backtesting on real 
 
 ---
 
+## Project Architecture
+<div align="center">
+<img width="600" height="600" alt="image" src="https://github.com/user-attachments/assets/ef0802d9-46ec-44fb-b293-595c0fc2bd2f" />
+</div>
+
+---
+
 ## Core Capabilities
 
 ### Continuous Advancement, Not One-shot Answers
